@@ -1,0 +1,87 @@
+---
+title: "How to Run"
+format: html
+editor: visual
+---
+
+This will be a fast guide on how to run the federeated environment step by step.
+
+# What do you need
+
+In order to make everything work properly you shuold:
+  - Install R
+  - Install Docker
+  - Download for our GitHub repo (https://github.com/FAIRVASC/federated/main) the Federated_Learning directory
+  
+::: panel-tabset
+
+## SQL
+
+### Step 1
+Open your shell, move into the Federated_Learning directory and create the password for the user-master communication and for the master-slave communication
+
+```bash
+export FAIRVASC_APP_PASSWORD='fairvasc'
+export FAIRVASC_WORKER_PASSWORD='worker'
+```
+
+### Step 2
+
+Run setup.sh
+
+```bash
+sh setup.sh SQL
+```
+
+### Step 3
+
+Run DataPreparation.R
+
+```bash
+Rscript DataPreparation.R
+```
+
+### Step 4
+Create or Check your /.Renviron file in order to have here the same password for the user you choose during step 1 
+
+### Step 5
+
+Run your script.R file using your favorite IDE
+
+### Step 6 
+
+Enjoy your Fairvasc SQL Federeated Environment 
+
+```r 
+fv_run_model('SQL', 'Linear', 'quality', FEATURE_COLS)
+```
+
+## SPARQL
+
+### Step 1
+Run DataPreparation.R up to line 70
+
+```bash
+head -n 70 DataPreparation.R | Rscript -
+```
+
+### Step 2
+
+Run setup.sh
+
+```bash
+sh setup.sh SQL
+```
+### Step 3
+
+Run your script.R file using your favorite IDE 
+
+### Step 4 
+
+Enjoy your Fairvasc SPARQL Federeated Environment 
+
+```r 
+fv_run_model('SPARQL', 'Linear', 'quality', FEATURE_COLS)
+```
+
+::: panel-tabset

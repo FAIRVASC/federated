@@ -1,0 +1,3 @@
+# ~/.Renviron
+FAIRVASC_APP_PASSWORD=fairvasc
+FAIRVASC_WORKER_PASSWORD=worker

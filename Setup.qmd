@@ -1,0 +1,176 @@
+---
+title: "Setup"
+---
+
+# Introduction
+
+Through this page you will find a guide for this ready to use SQL Federated Learning (FL) simulation. The aim is to help you to create from scratch an environment in which isolated containers (slave/registries) can be interrogated by authorized users via a 'super' container (master/web interface). We are using a single bash script as setup filef or both the SQL and SPARQL environments. All the container aspect is handled using docker.
+
+# Building the network
+
+Let's start delving into our setup file. For this example we will have 1 'super' container (master) and two registries (slave1 and slave2). First of all we need to define if we are going to work in SQL or SPARQL:
+
+``` bash
+#!/bin/bash
+set -e
+
+FRAMEWORK=$1
+NETWORK_NAME="Fairvasc"
+
+if [ -z "$FRAMEWORK" ]; then
+  echo " Error: Please specify the framework."
+  echo "Usage: sh setup.sh SQL   -or-   sh setup.sh SPARQL"
+  exit 1
+fi
+```
+
+**FRAMEWORK**: the type of environment we want to build. For now we developed the code only for SQL and SPARQL, but if needed in the future new languages structure could be added; \newline
+
+**NETWORK_NAME**: the name we are giving to our containers net. All containers joining the Network open a port for information exchange that can be reached only by the other Fairvasc-containers. \newline
+
+Now we clean possible previously existing containers and build our empty containers network:
+
+``` bash
+
+echo "▸ Cleaning up old containers..."
+docker rm -f master slave1 slave2 2>/dev/null || true
+docker network inspect $NETWORK_NAME >/dev/null 2>&1 || docker network create $NETWORK_NAME
+```
+
+Find attached specifics chunk of code for each of the available languages:
+
+::: panel-tabset
+## SQL
+
+Here you find the detailed code to build your SQL env.
+
+``` bash
+if [ "$FRAMEWORK" = "SQL" ]; then
+  echo -e "\n=== Booting SQL (PostgreSQL PL/v8) Environment ==="
+  IMAGE="sibedge/postgres-plv8"
+  docker pull $IMAGE
+
+  docker run -d --name master --network $NETWORK_NAME -p 5432:5432 -e POSTGRES_PASSWORD=password $IMAGE
+  until docker exec master pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+  docker exec master psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS plv8;"
+  docker exec master psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS dblink;"
+  
+  echo "▸ Creating restricted application role on master (fairvasc_app)..."
+  docker exec master psql -U postgres -c "CREATE ROLE fairvasc_app WITH LOGIN PASSWORD '$FAIRVASC_APP_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE;"
+
+
+  for i in 1 2; do
+    PORT=$((5432 + i))
+    echo "▸ Starting Slave $i Node (Port $PORT)..."
+    docker run -d --name slave$i --network $NETWORK_NAME -p $PORT:5432 -e POSTGRES_PASSWORD=slv$i $IMAGE
+    until docker exec slave$i pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+    docker exec slave$i psql -U postgres -c "CREATE EXTENSION IF NOT EXISTS plv8;"
+    docker exec slave$i psql -U postgres -c "CREATE ROLE worker_user WITH LOGIN PASSWORD '$FAIRVASC_WORKER_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE;"
+  done
+  echo -e "\n SQL Network is ready!"
+```
+
+**IMAGE**: the docker image that will be used inside our containers (for semplicty we are using the same image for all the containers). A good image in our scope must have: \newline \indent
+
+a.  *postgres*: our main SQL interpreter \newline \indent
+
+b.  *pl-v8*: a ready to use postgres extension that allows to compile JavaScript code directly inside the postgres environment \newline
+
+What this code is doing basically is creating our three containers starting on port 5432 (that is the standard one).
+
+Besides some informational prints, this command is quite simple: \newline
+
+*docker run*: basic comand used for starting a container; \newline
+
+*-d*: it means detach, after the container creation, it will run in background leaving the terminal free to be interrogated again; \newline
+
+*--name*: specify container name, in our case 'master'; \newline
+
+*--network*: through this command we are asking docker to add this container to our previously build network; \newline
+
+*-p*: defines a port to access the container from outside the network. For the structure of our simulation, we will use R to reach this container, although is also possible to make use of this same code in an R-less environment using just the shell as interface fir the user; \newline
+
+*-e POSTGRES_PASSWORD*: just uses our preferred master password as actual password of the container; \newline
+
+*\$IMAGE*: Import our **IMAGE** in the container. \newline
+
+After that we just wait until everything is settled up and ready to use, so we can build our extensions. In detail we are creating two extensions: \newline \indent
+
+a.  *pl-v8*: as specified before, it is our JavaScript compiler inside postgres \newline \indent
+
+b.  *dblink*: a ready to use postgres extension that allows to the container to broadcast a query to other containers aiming to collect and retrieve their answers. \newline
+
+The second one is required only for the master container, the slaves are supposed to be interrogated and not to interrogate, so they simply don't need it.
+
+Notice that for SQL both data and functions are not uploaded trough this setup in the containers. For simulated data visit the **Data Simulation** page, while for the functions inspect the page about the needed model
+
+## SPARQL
+
+Here you find the detailed code to build your SPARQL env.
+
+``` bash
+
+elif [ "$FRAMEWORK" = "SPARQL" ]; then
+  echo -e "\n=== Booting SPARQL (Apache Jena Fuseki) Environment ==="
+  FUSEKI_DIR="./fuseki-2.0"
+
+  echo "▸ Bundling JavaScript files for Fuseki..."
+  cat Federated_Network/utilities/*_master.js Federated_Network/SPARQL/*_master.js > fuseki_master_bundle.js 2>/dev/null || true
+  cat Federated_Network/utilities/*_slave.js Federated_Network/SPARQL/*_slave.js > fuseki_slave_bundle.js 2>/dev/null || true
+
+  echo "▸ Building Fuseki Image..."
+  cd "$FUSEKI_DIR" && docker build -t fuseki . && cd ..
+
+  start_fuseki() {
+    docker run -d --name "$1" --network $NETWORK_NAME -p "$2:3030" -v "$(pwd)/$3:/jsfuncs.js" fuseki --update --set arq:js-library=/jsfuncs.js --mem /fv
+  }
+
+  start_fuseki master 3030 fuseki_master_bundle.js
+  start_fuseki slave1 3031 fuseki_slave_bundle.js
+  start_fuseki slave2 3032 fuseki_slave_bundle.js
+  sleep 5
+
+  echo "▸ Uploading TTL datasets to Slaves..."
+  for i in 1 2; do
+    if [ -f "slave${i}.ttl" ]; then
+      curl -sf -X POST -H "Content-Type: text/turtle" --data-binary "@slave${i}.ttl" "http://localhost:303${i}/fv/data"
+    fi
+    if [ -f "cox_slave${i}.ttl" ]; then
+      curl -sf -X POST -H "Content-Type: text/turtle" --data-binary "@cox_slave${i}.ttl" "http://localhost:303${i}/fv/data"
+    fi
+  done
+  echo -e "\n SPARQL Network is ready!"
+fi
+```
+
+**FUSEKI_DIR**: the directory in which our own docker image is stored.
+
+Besides some informational prints, this command is quite simple: \newline We create two files:
+
+a.  *fuseki_master_bundle.js* containing all functions needed in the master to make every model work;
+b.  *fuseki_slave_bundle.js* containing all functions needed in the slaves to make every model work.
+
+We build our docker image and than through **the start_fuseki()** function we create our three containers: *docker run*: basic comand used for starting a container; \newline
+
+*-d*: it means detach, after the container creation, it will run in background leaving the terminal free to be interrogated again; \newline
+
+*--name*: specify container name, in our case 'master'; \newline
+
+*--network*: through this command we are asking docker to add this container to our previously build network; \newline
+
+*-p*: defines a port to access the container from outside the network. For the structure of our simulation, we will use R to reach this container, although is also possible to make use of this same code in an R-less environment using just the shell as interface fir the user; \newline
+
+*-v "\$(pwd)/\$3:/jsfuncs.js"*: \$(pwd)/\$3 gets the full path to a local file (where \$3 is the filename or relative path you pass as the 3rd argument to start_fuseki); \newline
+
+*fuseki*: name of the docker image to upload in the container;
+
+*--update*: enable SPARQL Update: Allows read-write SPARQL operations (e.g., INSERT, DELETE) on the Fuseki server rather than making it read-only;
+
+*--set arq:js-library=/jsfuncs.js*: registers the mounted JavaScript file (/jsfuncs.js) into Jena's ARQ query engine so you can use custom JavaScript functions directly inside your SPARQL queries;
+
+*--mem*: tells Fuseki to store the RDF dataset entirely in RAM instead of persisting it to the filesystem. (Data will be lost when the container stops).
+
+*/fv*: dataset name
+
+In the end we upload our prebuilt data (see Data Simulation) inside the slaves container.
+:::

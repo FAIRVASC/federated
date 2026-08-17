@@ -1,0 +1,518 @@
+---
+title: "Cox Proportional Hazard Model"
+format: html
+editor: visual
+---
+
+# The Algorithm
+
+The algorithm implements a Federated Cox Proportional Hazards model using the Newton-Raphson optimization method to maximize the partial likelihood. Unlike standard linear or Poisson regression, the Cox model requires evaluating the risk set at specific event times across the entire dataset. To achieve this in a federated architecture, the algorithm is split into two distinct phases:
+
+  -   **Phase 1: Event Time Discovery**: Before optimization begins, the global set of unique event times must be identified. Each slave node scans its local data to find the distinct times where an event occurred (ignoring right-censored observations). The master aggregates these local times, removes duplicates, and creates a globally sorted array of event times.
+
+  -   **Phase 2: Newton-Raphson Optimization**: Using the global event times, the master initiates an iterative loop. Given the current global parameter vector $\beta^{(t)}$:
+
+  -   **Local Computation (Slave Node)**: Each slave computes the linear predictor $\eta_i$ and local risk $\exp(\eta_i)$. For every global event time $t$, the slave calculates the partial derivatives of the partial likelihood: $S^{(0)}$ (sum of risk), $S^{(1)}$ (risk-weighted predictors), and $S^{(2)}$ (risk-weighted covariance) for all patients still at risk ($d.t \geq t$). It also tallies the predictor values (`event_sum`) for patients experiencing an event at exactly time $t$.
+  -   **Global Aggregation & Update (Master Node)**: The master aggregates the $S^{(0)}$, $S^{(1)}$, and $S^{(2)}$ components across all slaves for each time $t$. Using these global statistics, it computes the gradient vector ($U$) and the information/Hessian matrix ($I$). Finally, it computes the update step (delta) via matrix inversion: $\delta = I^{-1} U$, and updates the parameters.
+
+# Code Implementaation
+
+The core mathematical logic is implemented in pure ES5 JavaScript to guarantee cross-environment compatibility across different database platforms.
+
+## Common Code
+
+### Master
+
+```js
+// =============================================================
+// cox_master.js
+// Shared math for the MASTER NODE (SPARQL & SQL) - ES5 Pure
+// =============================================================
+
+/**
+ * Combina i vettori dei tempi locali estratti dai nodi slave,
+ * rimuove i duplicati e restituisce un array ordinato dei tempi globali.
+ */
+function aggregate_global_times(slave_times) {
+    var unique = {};
+    for (var i = 0; i < slave_times.length; i++) {
+        var arr = slave_times[i];
+        for (var j = 0; j < arr.length; j++) {
+            unique[arr[j]] = true;
+        }
+    }
+    var res = [];
+    for (var k in unique) {
+        res.push(parseFloat(k));
+    }
+    res.sort(function(a, b) { return a - b; });
+    return res;
+}
+
+/**
+ * Esegue l'inversione di una matrice quadrata usando l'eliminazione di Gauss-Jordan.
+ * Richiesto in puro ES5 per non dipendere da librerie esterne nel DB o in Fuseki.
+ */
+function invertMatrix(M) {
+    var n = M.length;
+    var A = [];
+    for (var i = 0; i < n; i++) {
+        A.push([]);
+        for (var j = 0; j < n; j++) {
+            A[i].push(M[i][j]);
+        }
+        for (var j = 0; j < n; j++) {
+            A[i].push(i === j ? 1.0 : 0.0);
+        }
+    }
+    
+    for (var i = 0; i < n; i++) {
+        var maxEl = Math.abs(A[i][i]);
+        var maxRow = i;
+        for (var k = i + 1; k < n; k++) {
+            if (Math.abs(A[k][i]) > maxEl) {
+                maxEl = Math.abs(A[k][i]);
+                maxRow = k;
+            }
+        }
+        var tmp = A[maxRow];
+        A[maxRow] = A[i];
+        A[i] = tmp;
+
+        var pivot = A[i][i];
+        if (Math.abs(pivot) < 1e-12) return null; // Matrice singolare
+        
+        for (var j = i; j < 2 * n; j++) {
+            A[i][j] /= pivot;
+        }
+        for (var k = 0; k < n; k++) {
+            if (k !== i) {
+                var c = A[k][i];
+                for (var j = i; j < 2 * n; j++) {
+                    A[k][j] -= c * A[i][j];
+                }
+            }
+        }
+    }
+    
+    var inv = [];
+    for (var i = 0; i < n; i++) {
+        inv.push([]);
+        for (var j = 0; j < n; j++) {
+            inv[i].push(A[i][j + n]);
+        }
+    }
+    return inv;
+}
+
+/**
+ * Aggrega le statistiche parziali calcolate dagli slave (S0, S1, S2)
+ * e calcola il passo di aggiornamento (delta) di Newton-Raphson.
+ */
+function master_update_cox(slave_results, p) {
+    var num_times = slave_results[0].length;
+    var U = []; for (var i = 0; i < p; i++) U.push(0.0);
+    var I_mat = [];
+    for (var i = 0; i < p; i++) {
+        var row = [];
+        for (var j = 0; j < p; j++) row.push(0.0);
+        I_mat.push(row);
+    }
+
+    // Ciclo su ogni istante temporale globale k
+    for (var k = 0; k < num_times; k++) {
+        var global_S0 = 0.0;
+        var global_S1 = []; for (var i = 0; i < p; i++) global_S1.push(0.0);
+        var global_S2 = [];
+        for (var i = 0; i < p; i++) {
+            var row = [];
+            for (var j = 0; j < p; j++) row.push(0.0);
+            global_S2.push(row);
+        }
+        var global_event_sum = []; for (var i = 0; i < p; i++) global_event_sum.push(0.0);
+        var global_count_events = 0;
+
+        // Aggrega le metriche sommandole tra tutti gli slave s
+        for (var s = 0; s < slave_results.length; s++) {
+            var res = slave_results[s][k];
+            global_S0 += res.S0;
+            global_count_events += res.count_events;
+            for (var i = 0; i < p; i++) {
+                global_S1[i] += res.S1[i];
+                global_event_sum[i] += res.event_sum[i];
+                for (var j = 0; j < p; j++) {
+                    global_S2[i][j] += res.S2[i][j];
+                }
+            }
+        }
+
+        // Calcola il gradiente e l'Hessiano se ci sono eventi in questo istante temporale
+        if (global_S0 > 0 && global_count_events > 0) {
+            var e_avg = [];
+            for (var i = 0; i < p; i++) {
+                e_avg.push(global_S1[i] / global_S0);
+            }
+
+            for (var i = 0; i < p; i++) {
+                U[i] += global_event_sum[i] - global_count_events * e_avg[i];
+            }
+
+            for (var i = 0; i < p; i++) {
+                for (var j = 0; j < p; j++) {
+                    var hess_contrib = (global_S2[i][j] / global_S0) - (e_avg[i] * e_avg[j]);
+                    I_mat[i][j] += global_count_events * hess_contrib;
+                }
+            }
+        }
+    }
+
+    // Risoluzione del sistema lineare: delta = I^(-1) * U
+    var cov = invertMatrix(I_mat);
+    var delta = [];
+    if (cov === null) {
+        for (var i = 0; i < p; i++) delta.push(0.0);
+        cov = I_mat; 
+    } else {
+        for (var i = 0; i < p; i++) {
+            var sum = 0.0;
+            for (var j = 0; j < p; j++) {
+                sum += cov[i][j] * U[j];
+            }
+            delta.push(sum);
+        }
+    }
+
+    return { delta: delta, cov: cov };
+}
+```
+
+The master logic manages aggregation and system solving:
+
+-   *aggregate_global_times(slave_times)*: Flattens the array of slave times using an object map to enforce uniqueness, then returns a globally sorted list.
+
+-   *invertMatrix(M)*: Provides matrix inversion using pure Gauss-Jordan elimination. It returns null if the matrix is singular (pivot \< $10^{−12}$).
+
+-   *master_update_cox(slave_results, p)*: Reconstructs the global $S^{(0)}$, $S^{(1)}$ and $S^{(2)}$ for each timestep. It calculates the gradient (U) and Hessian (I_mat) contributions for times where an event occurred globally. Solves the system using *invertMatrix* to yield the Newton-Raphson update step **delta**.
+
+### Slave
+
+```js
+// =============================================================
+// cox_slave.js
+// Shared math for the SLAVE NODE (SPARQL & SQL) - ES5 Pure
+// =============================================================
+
+function zeros(n, m) {
+    var arr = [];
+    for (var i = 0; i < n; i++) {
+        var row = [];
+        for (var j = 0; j < m; j++) row.push(0.0);
+        arr.push(row);
+    }
+    return arr;
+}
+
+// Phase 1: Discover local event times
+function compute_slave_discovery(yTimes, yEvents) {
+    var unique_times = {};
+    for (var i = 0; i < yTimes.length; i++) {
+        if (yEvents[i] === 1) {
+            unique_times[yTimes[i]] = true;
+        }
+    }
+    var times = [];
+    for (var t in unique_times) {
+        times.push(parseFloat(t));
+    }
+    times.sort(function(a, b) { return a - b; });
+    return times;
+}
+
+// Phase 2: Compute risk sets and partial likelihood derivatives
+function compute_slave_stats(xMatrix, yTimes, yEvents, beta, global_times) {
+    var p = beta.length;
+    var data = [];
+    var i, j, r, c;
+
+    for (i = 0; i < xMatrix.length; i++) {
+        var eta = 0.0;
+        for (j = 0; j < p; j++) eta += beta[j] * xMatrix[i][j];
+        
+        // Clamp risk to avoid Infinity/NaN errors in calculation
+        var risk = Math.exp(Math.max(-50, Math.min(50, eta)));
+        data.push({t: yTimes[i], e: yEvents[i], z: xMatrix[i], risk: risk});
+    }
+
+    // Sort by time ascending
+    data.sort(function(a, b) { return a.t - b.t; });
+
+    var results = [];
+    for (var k = 0; k < global_times.length; k++) {
+        var t = global_times[k];
+        var S0 = 0.0;
+        var S1 = [];      for (i = 0; i < p; i++) S1.push(0.0);
+        var S2 = zeros(p, p);
+        var event_sum = []; for (i = 0; i < p; i++) event_sum.push(0.0);
+        var count_events = 0;
+
+        for (i = 0; i < data.length; i++) {
+            var d = data[i];
+            
+            // Patient is still at risk
+            if (d.t >= t) {
+                S0 += d.risk;
+                for (j = 0; j < p; j++) S1[j] += d.z[j] * d.risk;
+                for (r = 0; r < p; r++) {
+                    for (c = 0; c < p; c++) {
+                        S2[r][c] += (d.z[r] * d.z[c]) * d.risk;
+                    }
+                }
+            }
+            // Patient experiences the event at exact time 't'
+            if (d.t === t && d.e === 1) {
+                count_events++;
+                for (j = 0; j < p; j++) event_sum[j] += d.z[j];
+            }
+        }
+        results.push({ time: t, S0: S0, S1: S1, S2: S2, event_sum: event_sum, count_events: count_events });
+    }
+    return results;
+}
+```
+
+The slave logic is divided into discovery and optimization statistics computation:
+
+-   *compute_slave_discovery(yTimes, yEvents)*: Filters local data where an event occurred (`yEvents === 1`), extracting and sorting unique event times.
+-   *compute_slave_stats(xMatrix, yTimes, yEvents, beta, global_times)*: Sorts the local data by time in ascending order. It calculates the risk, clamping the linear predictor `eta` strictly between $-50$ and $50$ to avoid `Infinity` or `NaN` errors. It then iterates through `global_times`, calculating `S0`, `S1`, `S2`, and `event_sum` based on patients at risk or experiencing the event at exactly time $t$.
+
+## Model specific implementation
+
+::::: panel-tabset
+
+## SQL
+
+::: panel-tabset
+
+### Master
+
+```js
+// =============================================================
+// SQL_cox_master.js
+// =============================================================
+
+const p = x_cols.length;
+let beta = Array(p).fill(0.0);
+const x_cols_pg = "{" + x_cols.join(",") + "}";
+const cols_sql_arr = x_cols.map(c => "'" + c + "'").join(",");
+
+// --- PHASE 1: DISCOVER GLOBAL EVENT TIMES ---
+let slave_times = [];
+for (const s of slaves) {
+    const conninfo = "host=" + s + " dbname=postgres user=worker_user password=worker";
+    const sql_discovery = `
+        SELECT result_json FROM dblink(
+            '${conninfo}',
+            $dblink$
+                SELECT sql_cox_slave(
+                    '${tbl_name}', '${time_col}', '${event_col}',
+                    ARRAY[${cols_sql_arr}]::text[], ARRAY[]::float8[], ARRAY[]::float8[]
+                )
+            $dblink$
+        ) AS t(result_json text);
+    `;
+    const query_result = plv8.execute(sql_discovery)[0];
+    if (query_result && query_result.result_json) {
+        slave_times.push(JSON.parse(query_result.result_json));
+    }
+}
+
+let global_times = aggregate_global_times(slave_times);
+const global_times_pg = "{" + global_times.join(",") + "}";
+
+// --- PHASE 2: NEWTON-RAPHSON LOOP ---
+let cov_final = null;
+
+for (let iter = 1; iter <= max_iter; iter++) {
+    const beta_pg = "{" + beta.join(",") + "}";
+    let slave_results = [];
+
+    for (const s of slaves) {
+        const conninfo = "host=" + s + " dbname=postgres user=worker_user password=worker";
+        const sql_nr = `
+            SELECT result_json FROM dblink(
+                '${conninfo}',
+                $dblink$
+                    SELECT sql_cox_slave(
+                        '${tbl_name}', '${time_col}', '${event_col}',
+                        ARRAY[${cols_sql_arr}]::text[], '${beta_pg}'::float8[], '${global_times_pg}'::float8[]
+                    )
+                $dblink$
+            ) AS t(result_json text);
+        `;
+        const r = plv8.execute(sql_nr)[0];
+        if (r && r.result_json) {
+            slave_results.push(JSON.parse(r.result_json));
+        }
+    }
+
+    const res = master_update_cox(slave_results, p);
+    
+    let diff = 0;
+    for (let i = 0; i < p; i++) {
+        beta[i] += res.delta[i];
+        diff += Math.abs(res.delta[i]);
+    }
+    
+    cov_final = res.cov;
+    if (diff < tol) break;
+}
+
+return JSON.stringify({ beta: beta, cov: cov_final });
+```
+
+`SQL_cox_master.js`: The body of the master function initializes the beta array to zero. It executes Phase 1 using dblink to query the worker nodes (slaves) databases and extract the event times. It then executes the Newton-Raphson loop in Phase 2, updating beta at each iteration and calling *master_update_cox*. Finally, it returns a JSON string containing beta and the final cov matrix.
+
+### Slave
+
+```js
+// =============================================================
+// SQL_cox_slave.js
+// =============================================================
+
+// This JS file contains the string body that R will inject into PostgreSQL.
+// It maps the PL/v8 SQL environment to the ES5 shared logic.
+var sql_slave_wrapper = `
+(function() {
+    const cols = x_columns.map(c => '"' + c + '"').join(",");
+    const sql = "SELECT \\"" + time_column + "\\" AS t, \\"" + event_column + "\\" AS e, " + cols + " FROM \\"" + table_name + "\\" WHERE \\"" + time_column + "\\" IS NOT NULL";
+    const rows = plv8.execute(sql);
+    
+    let xMatrix = [], yTimes = [], yEvents = [];
+    rows.forEach(r => {
+        let z = x_columns.map(c => { let v = Number(r[c]); return Number.isFinite(v) ? v : 0; });
+        xMatrix.push(z);
+        yTimes.push(Number(r.t));
+        yEvents.push(Number(r.e));
+    });
+
+    if (!global_times || global_times.length === 0) {
+        return JSON.stringify(compute_slave_discovery(yTimes, yEvents));
+    } else {
+        return JSON.stringify(compute_slave_stats(xMatrix, yTimes, yEvents, beta, global_times));
+    }
+})();
+`;
+```
+
+`SQL_cox_slave.js`: Consists of a dynamically injected script (by R) inside PostgreSQL. It executes a local SQL query on the specified table, converting the results into the xMatrix, yTimes, and yEvents arrays. If the global_times array is not provided or is empty, it starts the discovery phase; otherwise, it proceeds with the computation of partial statistics.
+
+:::
+
+## SPARQL
+
+::: panel-tabset
+
+### Master
+
+```js
+// =============================================================
+// SPARQL_cox_master.js
+// =============================================================
+
+function sparql_cox_discovery_master(slaveDataConcat) {
+    slaveDataConcat = String(slaveDataConcat);
+    var raw = slaveDataConcat.split("###");
+    var parts = [];
+    for (var i = 0; i < raw.length; i++) {
+        var s = raw[i].trim();
+        if (s.length > 0) parts.push(JSON.parse(s));  
+    }
+    return JSON.stringify(aggregate_global_times(parts));
+}
+
+function sparql_cox_nr_master(slaveDataConcat, p) {
+    slaveDataConcat = String(slaveDataConcat);
+    var raw = slaveDataConcat.split("###");
+    var parts = [];
+    for (var i = 0; i < raw.length; i++) {
+        var s = raw[i].trim();
+        if (s.length > 0) parts.push(JSON.parse(s));  
+    }
+    var res = master_update_cox(parts, parseInt(p));
+    return JSON.stringify(res);
+}
+```
+
+`SPARQL_cox_master.js`: Contains the *sparql_cox_discovery_master* and *sparql_cox_nr_master* functions. These functions take the concatenated strings generated by the slaves, split them using the "\###" delimiter, and convert the resulting fragments via JSON.parse before routing the data to the ES5 logic.
+
+### Slave
+
+```js
+// =============================================================
+// SPARQL_cox_slave.js
+// =============================================================
+
+function sparql_cox_discovery_slave(yTimesConcat, yEventsConcat) {
+    yTimesConcat = String(yTimesConcat); yEventsConcat = String(yEventsConcat);
+    if (!yTimesConcat || yTimesConcat.trim() === "") return JSON.stringify([]);
+    var rawT = yTimesConcat.split(";"); var rawE = yEventsConcat.split(";");
+    var yTimes = [], yEvents = [];
+    for (var i = 0; i < rawT.length; i++) {
+        if (rawT[i].trim().length > 0) {
+            yTimes.push(parseFloat(rawT[i].trim()));
+            yEvents.push(parseInt(rawE[i].trim()));
+        }
+    }
+    return JSON.stringify(compute_slave_discovery(yTimes, yEvents));
+}
+
+function sparql_cox_nr_slave(xConcat, yTimesConcat, yEventsConcat, betaStr, globalTimesStr) {
+    xConcat = String(xConcat); yTimesConcat = String(yTimesConcat); yEventsConcat = String(yEventsConcat);
+    betaStr = String(betaStr); globalTimesStr = String(globalTimesStr);
+    if (!xConcat || xConcat.trim() === "") return JSON.stringify([]);
+    var rawX = xConcat.split(";"); var rawT = yTimesConcat.split(";"); var rawE = yEventsConcat.split(";");
+    var xMatrix = [], yTimes = [], yEvents = [];
+    for (var i = 0; i < rawX.length; i++) {
+        var r = rawX[i].trim();
+        if (r.length > 0) {
+            var parts = r.split(" ");
+            var xRow = [];
+            for (var k = 0; k < parts.length; k++) xRow.push(parseFloat(parts[k]));
+            xMatrix.push(xRow);
+            yTimes.push(parseFloat(rawT[i].trim()));
+            yEvents.push(parseInt(rawE[i].trim()));
+        }
+    }
+    var p = xMatrix.length > 0 ? xMatrix[0].length : 1;
+    var beta = []; var bParts = betaStr.split(",");
+    for (var i = 0; i < p; i++) beta.push(parseFloat(bParts[i]));
+    var global_times = []; var tParts = globalTimesStr.split(",");
+    for (var i = 0; i < tParts.length; i++) {
+        if (tParts[i].trim().length > 0) global_times.push(parseFloat(tParts[i]));
+    }
+    return JSON.stringify(compute_slave_stats(xMatrix, yTimes, yEvents, beta, global_times));
+}
+```
+
+`SPARQL_cox_slave.js`: Contains the wrappers for discovery and optimization (*sparql_cox_discovery_slave* and *sparql_cox_nr_slave*). It decodes matrices and arrays, transitioning from text-serialized formats delimited by semicolons (;), commas (,), and spaces ( ) to the corresponding JavaScript data structures. It implicitly determines the number of covariates p based on the number of columns in xMatrix.
+
+:::
+
+:::::
+
+# Shared Data
+
+## Master to Slave
+
+At each iteration, the Master sends this string/array to the Slave:
+
+$\beta$ Vector: The array of current coefficients (e.g., \[-0.27, 0.19, -0.05\]).
+
+**Global Times Array (global_times)**: The list of all days/months in which at least one event occurred across the entire network (e.g., \[12, 14, 18, 25...\]).
+
+## Slave to Master
+
+The slaves sand informational data to the master two times:
+  - Phase 1 : JSON arrays containing the unique local survival times when the event of interest occurred.
+  - Phase 2 : Iterativly for each global timepoint slaves send structured vectors or JSON objects containing, for each time point: the time being examined (**time**), the sum at risk (**S0**), the vector (**S1**), the matrix (**S2**), the sum of covariates for those who experienced the event (**event_sum**), and the total number of events that occurred (**count_events**).
+  

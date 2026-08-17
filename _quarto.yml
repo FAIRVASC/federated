@@ -1,0 +1,38 @@
+project:
+  type: website
+
+website:
+  title: "Federated Statistical Learning in R"
+  navbar:
+    left:
+      - text: Home
+        file: index.qmd
+      - text: Setup & Reproducibility
+        menu:
+          - text: Data Simulation
+            file: Data_Simulation.qmd
+          - text: Docker Setup
+            file: Setup.qmd
+          - text: Security
+            file: Security.qmd
+      - text: Models
+        menu:
+          - text: Multivariate Linear Model
+            file: M_Linear.qmd
+          - text: Logistic Regression
+            file: Logistic.qmd
+          - text: Poisson Regression
+            file: Poisson.qmd
+          - text: Cox Proportional Hazard
+            file: Cox.qmd
+      - text: How To Run
+        file: HowToRun.qmd
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    number-sections: true
+    code-fold: true
+    code-tools: true
+    # bibliography: references.bib

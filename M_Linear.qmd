@@ -1,0 +1,316 @@
+---
+title: "Multivariate Linear Model"
+format: html
+editor: visual
+---
+
+# The Algorithm
+
+The algorithm implements a distributed Ordinary Least Squares (OLS) regression. Each slave node computes locally:
+
+$$X_{k}^TX_{k}$$
+
+and
+
+$$X_{k}^Ty_{k}.$$
+
+The master node aggregates the local statistics:
+
+$$X^TX=\sum_{k}X_{k}^TX_{k}$$
+
+$$X^Ty=\sum_{k}X_{k}^Ty_{k}$$
+
+The master estimates the global regression coefficients:
+
+$$\beta=(X^TX)^{-1}X^Ty$$
+
+The slave nodes compute their local RSS (Residual Sum of Squares) using the global estimate $\beta$. The master computes: residual variance, standard errors, t-statistics. The main advantage of this approach is that raw data never leaves the local nodes; only aggregated sufficient statistics are exchanged.
+
+# Code Implementation
+
+The core mathematical logic is implemented in pure ES5 JavaScript to guarantee cross-environment compatibility across different database platforms.
+
+## Common Code
+
+### Master
+
+``` js
+// =============================================================
+// LinReg_master.js
+// Shared math for the MASTER NODE (SPARQL & SQL) - ES5 Pure
+// =============================================================
+
+function linreg_master_update(slave_results) {
+    if (slave_results.length === 0) throw new Error("No data received from slaves.");
+
+    // Initialize with the first slave's components
+    var XTX = slave_results[0].XTX;
+    var XTY = slave_results[0].XTY;
+    var n = slave_results[0].n;
+    var ysum = slave_results[0].ysum;
+    var yty = slave_results[0].yty;
+
+    // Aggregate remaining slaves
+    for (var i = 1; i < slave_results.length; i++) {
+        var data = slave_results[i];
+        matAdd(XTX, data.XTX);
+        vecAdd(XTY, data.XTY);
+        n += data.n;
+        ysum += data.ysum;
+        yty += data.yty;
+    }
+
+    var p = XTY.length;
+    var df_residual = n - p;
+    var df_model = p - 1;
+
+    if (df_residual <= 0) throw new Error("Residual DF <= 0. Too many parameters.");
+
+    // Solve OLS
+    var beta = _solve(XTX, XTY);
+    var XTXinv = _inverse(XTX);
+
+    // Calculate RSS (Residual Sum of Squares)
+    var rss = yty;
+    for (var i = 0; i < p; i++) rss -= beta[i] * XTY[i];
+    if (rss < 0) rss = 0.0;
+
+    // Calculate TSS (Total Sum of Squares)
+    var tss = yty - (ysum * ysum) / n;
+    var s2 = rss / df_residual;
+
+    // Standard Errors & t-statistics
+    var se = [];
+    var t_stat = [];
+    for (var i = 0; i < p; i++) {
+        se.push(Math.sqrt(s2 * XTXinv[i][i]));
+        t_stat.push(beta[i] / se[i]);
+    }
+
+    var r2 = 1.0 - (rss / tss);
+    var adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / df_residual;
+    var f_stat = (r2 / df_model) / ((1.0 - r2) / df_residual);
+
+    return {
+        beta: beta,
+        se: se,
+        t_stat: t_stat,
+        n: n,
+        rss: rss,
+        tss: tss,
+        r2: r2,
+        adj_r2: adj_r2,
+        f_stat: f_stat,
+        df_model: df_model,
+        df_residual: df_residual
+    };
+}
+```
+
+The *linreg_master_update(slave_results)* function aggregates slave outputs and computes global regression metrics:
+
+-   Aggregates $X^T X$ , $X^T y$, sample size n, **ysum**, and **yty** across all slave node outputs.
+
+-   Checks that residual degrees of freedom (dfresidual=n−p) are greater than zero.
+
+-   Solves the OLS equation for coefficient vectorβ and computes matrix inverse (XTX)−1.
+
+-   Derives Residual Sum of Squares (RSS), Total Sum of Squares (TSS), standard errors, t-statistics, R2, adjusted R2, and F-statistic.
+
+### Slave
+
+``` js
+// =============================================================
+// LinReg_slave.js
+// Shared math for the SLAVE NODE (SPARQL & SQL) - ES5 Pure
+// =============================================================
+
+function linreg_slave_stats(xMatrix, yVals) {
+    var p = xMatrix.length > 0 ? xMatrix[0].length : 0;
+    var i, j, n;
+    
+    var XTX = [];
+    var XTY = [];
+    for (i = 0; i < p; i++) {
+        var row = [];
+        for (j = 0; j < p; j++) row.push(0.0);
+        XTX.push(row);
+        XTY.push(0.0);
+    }
+    
+    var ysum = 0.0;
+    var yty = 0.0;
+    var nobs = 0;
+
+    for (n = 0; n < xMatrix.length; n++) {
+        var xi = xMatrix[n];
+        var yi = yVals[n];
+        
+        if (isNaN(yi)) continue;
+
+        ysum += yi;
+        yty += yi * yi;
+
+        for (i = 0; i < p; i++) {
+            XTY[i] += xi[i] * yi;
+            for (j = 0; j < p; j++) {
+                XTX[i][j] += xi[i] * xi[j];
+            }
+        }
+        nobs++;
+    }
+
+    return {
+        XTX: XTX,
+        XTY: XTY,
+        n: nobs,
+        ysum: ysum,
+        yty: yty
+    };
+}
+```
+
+The *linreg_slave_stats(xMatrix, yVals)* function computes local matrix statistics:
+
+-   Accumulates $X^T X$ and $X^T y$ products over all local data rows.
+-   Tracks the count of valid observations $n$.
+-   Accumulates total response sum (`ysum`) and sum of squares (`yty`).
+-   Automatically filters out rows containing `NaN` target values.
+
+## Model specific implementation
+
+:::: panel-tabset
+## SQL
+
+### Master
+
+``` js
+// =============================================================
+// SQL_LinReg_master.js
+// PL/v8 function body for the SQL MASTER
+// =============================================================
+
+const cols_sql = x_cols.map(c => "'" + c + "'").join(",");
+let slave_results = [];
+
+// Query workers sequentially/parallelly
+for (const s of slaves) {
+    const conninfo = "host=" + s + " dbname=postgres user=worker_user password=worker";
+
+    const sql = `
+        SELECT result_json 
+        FROM dblink(
+            '${conninfo}',
+            $dblink$
+                SELECT sql_linreg_slave(
+                    '${tbl_name}',
+                    '${y_col}',
+                    ARRAY[${cols_sql}]::text[]
+                )
+            $dblink$
+        ) AS t(result_json text);
+    `;
+
+    const r = plv8.execute(sql)[0];
+    if (r && r.result_json) {
+        slave_results.push(JSON.parse(r.result_json));
+    }
+}
+
+// Compute the OLS solution
+const res = linreg_master_update(slave_results);
+
+// We return the aggregated statistical block as JSON so the R script 
+// can parse and format it exactly identical to the SPARQL flow.
+return JSON.stringify(res);
+```
+
+The SQL master implementation runs as a PL/v8 function in PostgreSQL: \* Connects to worker nodes sequentially using PostgreSQL dblink with connection details (worker_user, worker password, postgres database).
+
+-   Invokes *sql_linreg_slave remotely* on each worker node.
+
+-   Collects JSON outputs, passes them to *linreg_master_update*, and returns a JSON string compatible with R script formatting.
+
+## SPARQL
+
+::: panel-tabset
+### Master
+
+``` js
+// =============================================================
+// SPARQL_LinReg_master.js
+// =============================================================
+function sparql_linreg_master(slaveDataConcat) {
+    var raw = slaveDataConcat.split("|||");
+    var parts = [];
+    
+    for (var i = 0; i < raw.length; i++) {
+        var s = raw[i].trim();
+        if (s.length > 0) parts.push(JSON.parse(s));
+    }
+
+    var res = linreg_master_update(parts);
+    return JSON.stringify(res);
+}
+```
+
+Receives a concatenated string containing JSON outputs from all slaves separated by \|\|\|, parses each block, and computes the global OLS model.
+
+### Slave
+
+``` js
+// =============================================================
+// SPARQL_LinReg_slave.js
+// =============================================================
+function sparql_linreg_slave(xConcat, yConcat) {
+    if (!xConcat || xConcat.trim() === "") {
+        return JSON.stringify({ XTX: [], XTY: [], n: 0, ysum: 0.0, yty: 0.0 });
+    }
+
+    var rawX = xConcat.split("|");
+    var rawY = yConcat.split("|");
+    var xMatrix = [];
+    var yVals = [];
+
+    for (var i = 0; i < rawX.length; i++) {
+        var r = rawX[i].trim();
+        if (r.length > 0) {
+            var parts = r.split(" ");
+            var xRow = [1.0]; // Fixed intercept
+            for (var k = 0; k < parts.length; k++) xRow.push(parseFloat(parts[k]));
+            xMatrix.push(xRow);
+            yVals.push(parseFloat(rawY[i].trim()));
+        }
+    }
+
+    var result = linreg_slave_stats(xMatrix, yVals);
+    return JSON.stringify(result);
+}
+```
+
+Parses bar-delimited (\|) inputs, automatically prepends a fixed intercept term (1.0), and calculates local matrix statistics.
+:::
+::::
+
+# Shared Data
+
+## Master to Slave
+
+The Master sends execution parameters and metadata to the Slaves:
+
+-   **Database metadata**:
+    -   `tbl_name`: Target database table name.
+    -   `y_col`: Name of the dependent variable (target).
+    -   `x_cols`: Array/list of independent variable names (features/predictors).
+
+(Note: Unlike iterative algorithms, this standard OLS implementation completes in a single communication round. Therefore, the Master does not need to send coefficients ($\beta$) back to the Slaves).
+
+## Slave to Master
+
+Each Slave computes local sufficient statistics and returns a JSON payload containing:
+
+-   **`XTX`** ($X_k^T X_k$): Local cross-product matrix of predictors.
+-   **`XTY`** ($X_k^T y_k$): Local vector product of predictors and the target variable.
+-   **`n`**: Number of valid local observations (excluding `NaN` targets).
+-   **`ysum`** ($\sum y_{k}$): Sum of local target values.
+-   **`yty`** ($\sum y_{k}^2$): Sum of local squared target values.

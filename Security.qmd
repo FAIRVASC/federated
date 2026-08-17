@@ -1,0 +1,37 @@
+---
+title: "Security"
+format: html
+editor: visual
+---
+
+## Security Menegement
+
+One of the main aspect of this whole approach is to ensure that the user may only interrogate the intermediary (master), and that he will only ask pre-approved questions. That said, we have to define a security layer that will force the user to this limitations since in our idea the main field of application of this technology would be the medical area, and we do care about patients privacy. Ideally no port outside the network should be open for the slaves (we have it in our test env just for semplicity), so the first of the two constraints is already included in our build since the only way the user have to interact with the network is through the master. In order to accomplish and test also the second we are going to define some security features.
+
+[IMPORTANT: From now on we will refer just to the SQL security features because in our knowledge SPARQL do not have any built-in privacy preserving feature. It is a language thought to enhance sharability thus in our simulation we are accepting as a limit that the SPARQL user is meant to just be aware of the limits and guidlines he is supposed to follow, and wont by any means try to overcome those limits.]{style="font-size: 1.15em; font-weight: bold; color: red;"}
+
+## SQL Security
+
+In an SQL environment is possible to create and define different Users each with his personal characteristics.
+In this framework we are mainly using two different users:
+
+a.  The first one is the super user **'fairvasc_app'**, a specific user with limited amount of permits that we will define and control for the user-master communication; \newline \indent
+
+b.  The second is the user **'worker_user'**, a specific user with limited amount of permits that we will define and control for the master-slave communication.
+
+In the Docker Setup section you could have noticed a specific command during the slave creation:
+
+```bash
+echo "▸ Creating restricted application role on master (fairvasc_app)..."
+  docker exec master psql -U postgres -c "CREATE ROLE fairvasc_app WITH LOGIN PASSWORD '$FAIRVASC_APP_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE;"
+
+```
+
+This is defining in mastervour safe user that will have the right to perform calculus and have acces to all the function we are going to implement in the system.
+The **NOSUPERUSER NOCREATEDB NOCREATEROLE** is a specification that basically negates every power besides the one that we are explicitly giving to the role.
+
+We can do the same in the slaves for the master-slave communication:
+
+```bash
+docker exec slave$i psql -U postgres -c "CREATE ROLE worker_user WITH LOGIN PASSWORD '$FAIRVASC_WORKER_PASSWORD' NOSUPERUSER NOCREATEDB NOCREATEROLE;"
+```

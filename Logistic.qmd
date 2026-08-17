@@ -1,0 +1,377 @@
+---
+title: "Naive Logistic Regression"
+format: html
+editor: visual
+---
+
+# The Algorithm
+
+The algorithm implements an iterative Federated Logistic Regression using the **Newton-Raphson** optimization method (Iteratively Reweighted Least Squares). Because logistic regression lacks a closed-form solution, the model requires iterative updates until convergence.
+
+The probability model for binary classification is defined as:
+
+$$\mu_i = P(y_i = 1 | x_i) = \sigma(z_i) = \frac{1}{1 + e^{-z_i}}, \quad z_i = x_i^T \beta$$
+
+The global Log-Likelihood ($LL$) maximized by the model is:
+
+$$LL(\beta) = \sum_{i=1}^n \left[ y_i \ln(\mu_i) + (1 - y_i) \ln(1 - \mu_i) \right]$$
+
+In a federated architecture, the computation is distributed as follows:
+
+-   **Local Computation (Slave Node)**: Given the current global parameter vector $\beta^{(t)}$, each slave $k$ evaluates predicted probabilities $\mu_i$ for its local observations. To avoid numerical instability (such as $\ln(0)$), predictions are clamped to the range $[\epsilon, 1-\epsilon]$ with $\epsilon = 10^{-15}$. Each slave computes:
+
+    -   Local Log-Likelihood ($LL_k$)
+    -   Local Gradient vector $G_k = X_k^T (y_k - \mu_k)$
+    -   Local Hessian matrix $H_k = X_k^T W_k X_k$, where $W_k = \text{diag}(\mu_i (1 - \mu_i))$
+
+-   **Global Aggregation & Update (Master Node)**: The master aggregates summary statistics across all nodes:
+
+    $$H = \sum_k H_k, \quad G = \sum_k G_k, \quad LL = \sum_k LL_k$$
+
+    To handle potential matrix singularity when weights collapse toward zero, a ridge regularization parameter ($\lambda = 10^{-6}$) is added to the diagonal of $H$.
+
+    The raw Newton update step is computed as:
+
+    $$\text{raw\_delta} = H^{-1} G$$
+
+    A learning rate / damping factor ($\alpha = 0.3$) is applied to stabilize updates:
+
+    $$\Delta = \alpha \cdot \text{raw\_delta}$$
+
+    The parameter vector is updated as $\beta^{(t+1)} = \beta^{(t)} + \Delta$. The process repeats until the maximum coefficient change falls below the tolerance ($\max |\Delta_i| < 10^{-6}$) or maximum iterations are reached.
+
+# Code Implementaation
+
+The core mathematical logic is implemented in pure ES5 JavaScript to guarantee cross-environment compatibility across different database platforms.
+
+## Common Code
+
+### Master
+
+```js
+// =============================================================
+// naive_LogReg_master.js
+// Shared math for the MASTER NODE (SPARQL & SQL) - ES5 Pure
+// =============================================================
+
+function logreg_master_update(slave_results) {
+    if (slave_results.length === 0) throw new Error("No data received from slaves.");
+
+    var p = slave_results[0].G.length;
+    var i, j, k;
+    
+    var H = [];
+    for (i = 0; i < p; i++) {
+        var r = [];
+        for (j = 0; j < p; j++) r.push(0.0);
+        H.push(r);
+    }
+    var G = [];
+    for (i = 0; i < p; i++) G.push(0.0);
+    
+    var LL = 0.0;
+    var n_total = 0;
+    var sum_y = 0.0;
+
+    for (k = 0; k < slave_results.length; k++) {
+        var data = slave_results[k];
+        LL += data.LL;
+        n_total += data.n;
+        sum_y += data.sum_y;
+        for (i = 0; i < p; i++) {
+            G[i] += data.G[i];
+            for (j = 0; j < p; j++) {
+                H[i][j] += data.H[i][j];
+            }
+        }
+    }
+
+    var ridge = 1e-6;
+    for (i = 0; i < p; i++) H[i][i] += ridge;
+
+    var alpha = 0.3;
+    var raw_delta = _solve(H, G);
+    var delta = [];
+    for (i = 0; i < p; i++) delta.push(alpha * raw_delta[i]);
+
+    var H_inv = _inverse(H);
+
+    return {
+        delta: delta,
+        H_inv: H_inv,
+        LL: LL,
+        n: n_total,
+        sum_y: sum_y
+    };
+}
+```
+
+The logreg_master_update(slave_results) function handles global aggregation and step calculation:
+
+-   Sums local Hessian matrices H, Gradient vectors G, Log-Likelihood values LL, sample sizes n, and target sums ∑y
+-   Applies a diagonal ridge term (10 −6 ) to H to ensure invertibility
+-   Solves H⋅raw_delta=G and scales the update vector by learning rate $\alpha$ =0.3
+-   Inverts H to produce $H^−1$ (the asymptotic variance-covariance matrix) for standard error calculation
+
+### Slave
+
+```js
+// =============================================================
+// naive_LogReg_slave.js
+// Shared math for the SLAVE NODE (SPARQL & SQL) - ES5 Pure
+// =============================================================
+
+function logreg_slave_stats(xMatrix, yVals, beta) {
+    var p = beta.length;
+    var i, j, n;
+    
+    var H = [];
+    for (i = 0; i < p; i++) {
+        var row = [];
+        for (j = 0; j < p; j++) row.push(0.0);
+        H.push(row);
+    }
+    var G = [];
+    for (i = 0; i < p; i++) G.push(0.0);
+
+    var LL = 0.0;
+    var sum_y = 0.0;
+    var nobs = 0;
+
+    for (n = 0; n < xMatrix.length; n++) {
+        var xi = xMatrix[n];
+        var yi = yVals[n];
+        
+        if (isNaN(yi)) continue;
+
+        sum_y += yi;
+
+        var z = 0.0;
+        for (j = 0; j < p; j++) z += xi[j] * beta[j];
+
+        // mu = 1 / (1 + e^-z)
+        var mu = 1.0 / (1.0 + Math.exp(-z));
+        
+        // Clamping to avoid log(0)
+        if (mu < 1e-15) mu = 1e-15;
+        if (mu > 1.0 - 1e-15) mu = 1.0 - 1e-15;
+
+        var w = mu * (1.0 - mu);
+
+        LL += yi * Math.log(mu) + (1.0 - yi) * Math.log(1.0 - mu);
+
+        for (i = 0; i < p; i++) {
+            G[i] += xi[i] * (yi - mu);
+            for (j = 0; j < p; j++) {
+                H[i][j] += xi[i] * xi[j] * w;
+            }
+        }
+        nobs++;
+    }
+
+    return {
+        H: H,
+        G: G,
+        LL: LL,
+        n: nobs,
+        sum_y: sum_y
+    };
+}
+```
+
+The *logreg_slave_stats(xMatrix, yVals, beta)* function computes local first- and second-order derivatives:
+
+-   Computes linear predictors $z = X\beta$ and logistic probabilities $\mu = \frac{1}{1 + e^{-z}}$.
+-   Clamps $\mu$ within $[10^{-15}, 1 - 10^{-15}]$ for numerical safety.
+-   Evaluates observation weight $w = \mu(1 - \mu)$.
+-   Accumulates local Gradient vector $G$, Hessian matrix $H$, total $LL$, sample size $n$, and $\sum y$.
+
+## Model specific implementation
+
+::::: panel-tabset
+## SQL
+
+::: panel-tabset
+### Master
+
+```js
+// =============================================================
+// SQL_naive_LogReg_master.js
+// PL/v8 function body for the SQL MASTER
+// =============================================================
+
+const p = x_cols.length + 1;
+let beta = Array(p).fill(0.0);
+let final_obj = null;
+const tol = 1e-6;
+
+const terms = ["(Intercept)"].concat(x_cols);
+const cols_sql = x_cols.map(c => "'" + c + "'").join(",");
+
+for (let iter = 1; iter <= n_iter; iter++) {
+    const beta_sql = `ARRAY[${beta.join(",")}]::float8[]`;
+    let slave_results = [];
+
+    for (const s of slaves) {
+        const conninfo = "host=" + s + " dbname=postgres user=worker_user password=worker";
+
+        const sql = `
+            SELECT result_json 
+            FROM dblink(
+                '${conninfo}',
+                $dblink$
+                    SELECT sql_logreg_slave(
+                        '${tbl_name}',
+                        '${y_col}',
+                        ARRAY[${cols_sql}]::text[],
+                        ${beta_sql}
+                    )
+                $dblink$
+            ) AS t(result_json text);
+        `;
+
+        const r = plv8.execute(sql)[0];
+        if (r && r.result_json) {
+            slave_results.push(JSON.parse(r.result_json));
+        }
+    }
+
+    const res = logreg_master_update(slave_results);
+    final_obj = res;
+    
+    let max_delta = 0.0;
+    for (let i = 0; i < p; i++) {
+        beta[i] += res.delta[i];
+        if (Math.abs(res.delta[i]) > max_delta) max_delta = Math.abs(res.delta[i]);
+    }
+
+    plv8.elog(INFO, `Iter ${iter}: LL=${res.LL}, Max Delta=${max_delta}`);
+
+    if (max_delta < tol || iter === n_iter) {
+        // Calcolo delle statistiche finali per l'output
+        for (let i = 0; i < p; i++) {
+            const se = Math.sqrt(res.H_inv[i][i]);
+            const z_stat = beta[i] / se;
+            
+            // Standard Normal CDF approximation per p-value
+            const p_val = 2 * (1 - jStat_normal_cdf(Math.abs(z_stat)));
+
+            plv8.return_next({
+                iteration: iter,
+                term: terms[i],
+                estimate: beta[i],
+                std_error: se,
+                z_value: z_stat,
+                p_value: p_val,
+                log_likelihood: res.LL
+            });
+        }
+        break;
+    }
+}
+return;
+
+// Helper: Approx normal CDF for PLv8
+function jStat_normal_cdf(x) {
+    var t = 1 / (1 + 0.231641888 * Math.abs(x));
+    var d = 0.3989422804 * Math.exp(-x * x / 2);
+    var p = d * t * (0.31938153 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+    return x > 0 ? 1 - p : p;
+}
+```
+
+The PL/v8 master function implements the iterative loop:
+
+-   Manages the parameter state vector **beta** initialized to zero.
+
+-   Dispatches *sql_logreg_slave* to worker nodes using PostgreSQL `dblink`, passing the current **beta** array on each iteration.
+
+-   Updates **beta** using **res.delta** and monitors convergence (`max_delta < 1e-6`).
+
+-   Upon convergence, calculates standard errors $SE_i= \sqrt (H_{i,i}^-1)$, z-statistics $(z=\frac\beta {SE})$, and p-values via standard normal Cumulative Distribution Function (CDF) approximation.
+:::
+
+## SPARQL
+
+::: panel-tabset
+### Master
+
+```js
+function sparql_logreg_master(slaveDataConcat) {
+    var raw = slaveDataConcat.split("|||");
+    var parts = [];
+    
+    for (var i = 0; i < raw.length; i++) {
+        var s = raw[i].trim();
+        if (s.length > 0) parts.push(JSON.parse(s));
+    }
+
+    var res = logreg_master_update(parts);
+    return JSON.stringify(res);
+}
+```
+
+Receives concatenated JSON outputs from slave nodes separated by |||, parses the payload, and invokes *logreg_master_update*.
+
+### Slave
+
+```js
+function sparql_logreg_slave(xConcat, yConcat, betaStr) {
+    if (!xConcat || xConcat.trim() === "") {
+        return JSON.stringify({ H: [], G: [], LL: 0.0, n: 0, sum_y: 0.0 });
+    }
+
+    var rawX = xConcat.split("|");
+    var rawY = yConcat.split("|");
+    var xMatrix = [];
+    var yVals = [];
+
+    for (var i = 0; i < rawX.length; i++) {
+        var r = rawX[i].trim();
+        if (r.length > 0) {
+            var parts = r.split(" ");
+            var xRow = [1.0];
+            for (var k = 0; k < parts.length; k++) xRow.push(parseFloat(parts[k]));
+            xMatrix.push(xRow);
+            yVals.push(parseFloat(rawY[i].trim()));
+        }
+    }
+
+    var p = xMatrix.length > 0 ? xMatrix[0].length : 1;
+    var beta = [];
+    if (betaStr && betaStr.trim() !== "") {
+        var bParts = betaStr.split(",");
+        for (var i = 0; i < p; i++) beta.push(parseFloat(bParts[i]));
+    } else {
+        for (var i = 0; i < p; i++) beta.push(0.0);
+    }
+
+    var result = logreg_slave_stats(xMatrix, yVals, beta);
+    return JSON.stringify(result);
+}
+```
+
+Parses bar-delimited (|) data, automatically prepends the fixed intercept term (1.0), extracts the current coefficient vector beta from a comma-separated string betaStr, and evaluates local statistics.
+
+:::
+:::::
+
+# Shared Data
+
+## Master to Slave
+
+The Master sends this to the Slave:
+
+**Database metadata**: Table name and column names (tbl_name, y_col, x_cols); **beta**: The current global parameter vector $\beta^t$. This vector is required by slaves to update predictions $\mu_i$, observation weights $w_i$, gradient $G_k$, and Hessian $H_k$.
+
+## Slave to Master
+
+**H (Hessian)**: Local Hessian matrix $X_{k}^TW_kX_k$.
+
+**G (Gradient)**: Local Gradient vector $X_{k}^T(y_k-\mu_k)$.
+
+**LL**: Local Log-Likelihood contribution
+
+**n**: The number of local observations belonging to the two classes being compared.
+
+**sum_y**: Local sum of the target binary variable

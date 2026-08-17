@@ -1,0 +1,465 @@
+---
+title: "Tabset"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+:::: panel-tabset
+## SQL
+
+# Slave function
+
+This is the core computational unit located on each worker node.
+
+It queries the survival data (time, event, and predictors) and calculates the Risk Score for each patient using the current coefficients: $Risk=e^{\sumβ_iz_i}$.
+
+Two-Phase Execution:
+
+If the Master sends an empty array of global times, the slave simply returns a list of unique event times found in its local data. Once the Master provides the global_times, the slave calculates three vital statistics for every time point t: - S0: Sum of risks of patients still at risk at time t. - S1: Weighted sum of predictors ($z⋅Risk$) for patients at risk. - S2: Weighted outer product of predictors ($z⋅z^T⋅Risk$). - Event Sum: The sum of predictors for patients who actually experienced the event at time t.
+
+```{r, eval=FALSE}
+library(DBI)
+library(RPostgres)
+
+###############################################################################
+#Slave - Cox Hazard Survival Model
+###############################################################################
+
+slave_cox <- 'CREATE OR REPLACE FUNCTION slave_cox_js(
+  table_name text,
+  time_column text,
+  event_column text,
+  x_columns text[],
+  beta float8[],
+  global_times float8[] 
+)
+RETURNS TABLE (
+  stats jsonb,
+  n int
+)
+LANGUAGE plv8
+SECURITY DEFINER
+AS $$
+
+function zeros(n,m){ return Array.from({length:n},()=>Array(m).fill(0)); }
+
+function outer(z){
+  const p=z.length; const M=zeros(p,p);
+  for(let i=0;i<p;i++) for(let j=0;j<p;j++) M[i][j]=z[i]*z[j];
+  return M;
+}
+
+const p = x_columns.length;
+const cols = x_columns.map(c => `"${c}"`).join(",");
+const sql = `SELECT "${time_column}" AS t, "${event_column}" AS e, ${cols} 
+             FROM "${table_name}" WHERE "${time_column}" IS NOT NULL`;
+const rows = plv8.execute(sql);
+
+let data = [];
+for(const r of rows){
+  let z = x_columns.map(c => {
+    let v = Number(r[c]); return Number.isFinite(v) ? v : 0;
+  });
+  const t = Number(r.t);
+  const e = Number(r.e);
+  let eta = 0;
+  for(let i=0;i<p;i++) eta += beta[i] * z[i];
+  const risk = Math.exp(Math.max(-50, Math.min(50, eta)));
+  data.push({t, e, z, risk});
+}
+
+data.sort((a,b) => a.t - b.t);
+
+// FASE DI PRE-STEP: Se non ho global_times, ritorno solo i tempi degli eventi locali
+if (!global_times || global_times.length === 0) {
+    const local_events = [...new Set(data.filter(d => d.e === 1).map(d => d.t))];
+    let res = local_events.map(t => ({ time: t }));
+    return [{ stats: res, n: data.length }];
+}
+
+// FASE DI CALCOLO: Uso l array globale dei tempi imposto dal Master
+let results = [];
+for(const t of global_times){
+  let S0 = 0, S1 = Array(p).fill(0), S2 = zeros(p,p);
+  let event_sum = Array(p).fill(0);
+  let count_events = 0;
+
+  for(const d of data){
+    if(d.t >= t){
+      S0 += d.risk;
+      for(let i=0;i<p;i++) S1[i] += d.z[i] * d.risk;
+      const O = outer(d.z);
+      for(let i=0;i<p;i++) for(let j=0;j<p;j++) S2[i][j] += O[i][j] * d.risk;
+    }
+    if(d.t === t && d.e === 1){
+      count_events++;
+      for(let i=0;i<p;i++) event_sum[i] += d.z[i];
+    }
+  }
+  results.push({ time: t, S0, S1, S2, event_sum, count_events });
+}
+return [{ stats: results, n: data.length }];
+$$;'
+```
+
+# Master Function
+
+Time Discovery: It connects to all slaves to identify every unique time point where an event occurred across the entire federation. It creates a sorted global_times array.
+
+The Newton-Raphson Loop: It sends the current $\beta$ and the global_times to all slaves via dblink.
+
+Sums the S0, S1, S2, and Event Sums from all slaves for each time point.
+
+Score Vector (U) and Hessian (I): It calculates the global log-likelihood gradient (U) and the information matrix (I).
+
+It uses the formula: $U=\sum(EventSum−d_t⋅mean)$ and $I=\sum d_t⋅(\frac{S2}{S0}−mean⋅mean^T)$.
+
+It inverts the Hessian and updates beta: $β_{new}=β_{old}+I^{−1}U$.
+
+Convergence: The loop breaks if the change in beta is smaller than the tolerance (tol).
+
+```{r, eval=FALSE}
+###############################################################################
+# Master - Cox Hazard Survival Model (CORRETTO - Scope I fixato)
+###############################################################################
+
+master_cox <- 'CREATE OR REPLACE FUNCTION master_federated_cox_plv8(
+  slaves text[],
+  tbl_name text,
+  time_col text,
+  event_col text,
+  x_cols text[],
+  tol float8 DEFAULT 1e-6,
+  max_iter int DEFAULT 50
+)
+RETURNS TABLE (
+  iteration int, term text, estimate float8, std_error float8, z_value float8
+)
+LANGUAGE plv8 AS $$
+
+// ... [Mantieni le tue funzioni zeros, vecAdd, vecSub, matAdd, matVec, matInv] ...
+function zeros(n, m) { return Array.from({ length: n }, () => Array(m).fill(0)); }
+function vecAdd(a, b) { for (let i = 0; i < a.length; i++) a[i] += b[i]; }
+function vecSub(a, b) { for (let i = 0; i < a.length; i++) a[i] -= b[i]; }
+function matAdd(A, B) { for (let i = 0; i < A.length; i++) for (let j = 0; j < A[0].length; j++) A[i][j] += B[i][j]; }
+function matVec(A, x) {
+  const r = Array(A.length).fill(0);
+  for (let i = 0; i < A.length; i++) for (let j = 0; j < x.length; j++) r[i] += A[i][j] * x[j];
+  return r;
+}
+function matInv(A) {
+  const n = A.length; const M = A.map(r => r.slice());
+  const I_mat = zeros(n, n); for (let i = 0; i < n; i++) I_mat[i][i] = 1;
+  for (let i = 0; i < n; i++) {
+    let f = M[i][i];
+    if (Math.abs(f) < 1e-12) continue; 
+    for (let j = 0; j < n; j++) { M[i][j] /= f; I_mat[i][j] /= f; }
+    for (let k = 0; k < n; k++) {
+      if (k === i) continue;
+      let g = M[k][i];
+      for (let j = 0; j < n; j++) { M[k][j] -= g * M[i][j]; I_mat[k][j] -= g * I_mat[i][j]; }
+    }
+  }
+  return I_mat;
+}
+
+
+const p = x_cols.length;
+let beta = Array(p).fill(0);
+let I_hessian; 
+
+// --- PRE-STEP: SCOPERTA DEI TEMPI GLOBALI ---
+let global_times_set = new Set();
+const x_cols_pg = "{" + x_cols.join(",") + "}";
+
+for (const s of slaves) {
+  const conninfo = `host=${s} dbname=postgres user=worker_user password=worker`;
+  const sql_discovery = `
+    SELECT stats FROM dblink(
+      ${plv8.quote_literal(conninfo)},
+      format($q$ SELECT stats FROM slave_cox_js(%L, %L, %L, %L::text[], ARRAY[]::float8[], ARRAY[]::float8[]) $q$,
+        ${plv8.quote_literal(tbl_name)},
+        ${plv8.quote_literal(time_col)},
+        ${plv8.quote_literal(event_col)},
+        ${plv8.quote_literal(x_cols_pg)}
+      )
+    ) AS t(stats jsonb);
+  `;
+  const query_result = plv8.execute(sql_discovery);
+  if (query_result && query_result.length > 0) {
+    for (const row of query_result[0].stats) global_times_set.add(row.time);
+  }
+}
+let global_times = Array.from(global_times_set).sort((a,b) => a - b);
+const global_times_pg = "{" + global_times.join(",") + "}";
+// ---------------------------------------------
+
+for (let iter = 1; iter <= max_iter; iter++) {
+  let U = Array(p).fill(0);
+  I_hessian = zeros(p, p);
+  let global = {};
+
+  for (const s of slaves) {
+    const conninfo = `host=${s} dbname=postgres user=worker_user password=worker`;
+    const beta_pg = "{" + beta.join(",") + "}";
+
+    // Chiamata passando l array global_times_pg
+    const sql = `
+      SELECT stats 
+      FROM dblink(
+        ${plv8.quote_literal(conninfo)},
+        format($q$ SELECT stats FROM slave_cox_js(%L, %L, %L, %L::text[], %L::float8[], %L::float8[]) $q$,
+          ${plv8.quote_literal(tbl_name)},
+          ${plv8.quote_literal(time_col)},
+          ${plv8.quote_literal(event_col)},
+          ${plv8.quote_literal(x_cols_pg)},
+          ${plv8.quote_literal(beta_pg)},
+          ${plv8.quote_literal(global_times_pg)}
+        )
+      ) AS t(stats jsonb);
+    `;
+
+    const query_result = plv8.execute(sql);
+    if (!query_result || query_result.length === 0) continue;
+
+    const arr = query_result[0].stats;
+    for (const row of arr) {
+      const t = row.time;
+      if (!global[t]) {
+        global[t] = { S0: 0, S1: Array(p).fill(0), S2: zeros(p, p), event_sum: Array(p).fill(0), count_events: 0 };
+      }
+      const g = global[t];
+      g.S0 += row.S0;
+      g.count_events += row.count_events;
+      vecAdd(g.S1, row.S1);
+      matAdd(g.S2, row.S2);
+      vecAdd(g.event_sum, row.event_sum);
+    }
+  }
+
+  for (const t in global) {
+    const g = global[t];
+    if (g.S0 === 0) continue;
+    
+    const d_t = g.count_events;
+    if (d_t === 0) continue; // Skip se non ci sono eventi globali a questo tempo
+
+    const mean = g.S1.map(v => v / g.S0);
+
+    for (let i = 0; i < p; i++) {
+      U[i] += g.event_sum[i] - (d_t * mean[i]);
+      for (let j = 0; j < p; j++) {
+        I_hessian[i][j] += d_t * (g.S2[i][j] / g.S0 - mean[i] * mean[j]);
+      }
+    }
+  }
+
+  for (let i = 0; i < p; i++) I_hessian[i][i] += 1e-9;
+  const Iinv = matInv(I_hessian);
+  const delta = matVec(Iinv, U);
+
+  let diff = 0;
+  for (let i = 0; i < p; i++) {
+    beta[i] += delta[i];
+    diff += Math.abs(delta[i]);
+  }
+
+  if (diff < tol) break;
+}
+
+const cov = matInv(I_hessian);
+for (let i = 0; i < p; i++) {
+  const se = Math.sqrt(Math.max(0, cov[i][i]));
+  plv8.return_next({
+    iteration: max_iter,
+    term: x_cols[i],
+    estimate: beta[i],
+    std_error: se,
+    z_value: beta[i] / se
+  });
+}
+return;
+$$;'
+```
+
+# Teach the new Functions to master and slaves than test
+
+For testing purposes we suggest the **bladder** dataset from the *survival* package
+
+```{r, eval=FALSE}
+
+library(survival)
+bladder <- bladder
+bladder$treatment <- bladder$rx - 1
+bladder1 <- bladder[1:200,]
+bladder2 <- bladder[201:340,]
+
+###############################################################################
+#Slave - Function Creation 
+###############################################################################
+con <- dbConnect(RPostgres::Postgres(),
+                 host = 'localhost',
+                 port = 5433,
+                 user = 'postgres',
+                 password = 'slv1')
+
+dbWriteTable(conn = con, 
+             name = "risk",
+             value = bladder1,
+             overwrite = TRUE)
+
+dbExecute(conn = con,
+          statement = slave_cox)
+
+dbExecute(conn = con,
+          statement = 'GRANT EXECUTE ON FUNCTION slave_cox_js(text, text, text, text[], float8[], float8[]) TO worker_user;'
+)
+dbDisconnect(con)
+
+con <- dbConnect(RPostgres::Postgres(),
+                 host = 'localhost',
+                 port = 5434,
+                 user = 'postgres',
+                 password = 'slv2')
+
+dbWriteTable(conn = con, 
+             name = "risk",
+             value = bladder2,
+             overwrite = TRUE)
+
+dbExecute(conn = con,
+          statement = slave_cox)
+
+dbExecute(conn = con,
+          statement = 'GRANT EXECUTE ON FUNCTION slave_cox_js(text, text, text, text[], float8[], float8[]) TO worker_user;'
+)
+dbDisconnect(con)
+
+###############################################################################
+#Master - Function Creation end test
+###############################################################################
+
+con <- dbConnect(RPostgres::Postgres(),
+                 host = 'localhost',
+                 port = 5432,
+                 user = 'postgres',
+                 password = 'password')
+
+dbExecute(con, master_cox)
+
+qry_template <- "
+SELECT *
+FROM master_federated_cox_plv8(
+  %s::text[],
+  %s::text,
+  %s::text,
+  %s::text,
+  %s::text[]
+);
+"
+slaves_sql <- paste0(
+  "ARRAY[",
+  paste(DBI::dbQuoteString(con, c("slave1", "slave2")), collapse = ","),
+  "]"
+)
+
+xcols_sql <- paste0(
+  "ARRAY[",
+  paste(DBI::dbQuoteString(con, c("treatment", "number", "size")), collapse = ","),
+  "]"
+)
+
+
+qry_final <- sprintf(
+  qry_template,
+  slaves_sql,
+  DBI::dbQuoteString(con, "risk"),
+  DBI::dbQuoteString(con, "stop"),
+  DBI::dbQuoteString(con, "event"),
+  xcols_sql
+)
+
+res <- dbGetQuery(con,qry_final)
+str(res)
+
+test <- coxph(Surv(stop, event)~ treatment + number + size, bladder, ties = 'breslow')
+summary(test)
+
+```
+
+::: panel-tabset
+### Nested section 1
+
+blabla
+
+### Nested section 2
+
+bla1 bla2 bla3
+:::
+
+## Sparql
+
+Write some random stuff here
+
+``` python
+def fizz_buzz(num):
+  if num % 15 == 0:
+    print("FizzBuzz")
+  elif num % 5 == 0:
+    print("Buzz")
+  elif num % 3 == 0:
+    print("Fizz")
+  else:
+    print(num)
+```
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+## C
+
+``` r
+1 + 1
+```
+
+## Not everything is code
+
+Thats a non code tabset section
+::::
+
+# Shared Data
+
+## Master to Slave
+
+At each iteration, the Master sends this string/array to the Slave:
+
+**Database metadata**: Table name and column names (tbl_name, time_col, event_col, x_cols).
+
+**β Vector**: The array of current coefficients (e.g., \[-0.27, 0.19, -0.05\]).
+
+**Global Times Array (global_times)**: The list of all days/months in which at least one event occurred across the entire network (e.g., \[12, 14, 18, 25...\]).
+
+## Slave to Master
+
+For each time t contained in the global_times array, the Slave returns a JSON object containing exclusively these 5 aggregated metrics:
+
+**S0 (Scalar)**: Anonymous sum of risks.
+
+**S1 (Vector)**: Anonymous sum of covariates multiplied by the risk.
+
+**S2 (Matrix)**: Anonymous sum of the cross-products of covariates multiplied by the risk.
+
+**count_events (Integer)**: How many people in the Slave experienced the event at exactly time t.
+
+**event_sum (Vector)**: The mathematical sum of the covariates (X values) of the patients who experienced the event at time t.
+
+## Code
+
+```{r}
+1 + 1
+```

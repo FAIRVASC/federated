@@ -1,0 +1,60 @@
+---
+title: "Federated Learning in SQL/SPARQL + R"
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+## FAIRVASC
+
+FAIRVASC is a Europe-wide research project initiated by Prof. Mark
+Little (University of Dublin, Ireland) and Prof. Augusto Vaglio
+(University of Florence, Italy), funded by the European Joint Programme
+on Rare Diseases (EJPRD 2019). Its goal is to create Findable,
+Accessible, Interoperable, Reusable (FAIR) access to a network of
+ANCA-Associated Vasculitis (AAV) registries, enhancing research and care
+for AAV. The project has developed an infrastructure linking seven
+national/regional AAV registries into a single European dataset,
+providing a rich, reliable resource for ethical and secure research.
+
+This infrastructure uses Semantic Web Technologies for privacy-compliant
+federated querying and semantic interoperability, enabling high-quality
+clinical research and federated learning for complex statistical
+modeling.
+
+In FAIRVASC, this large new European resource will be analysed to
+identify features (clinical and physical characteristics, etc.) that
+predict how a patient’s illness will develop, and what their major
+health risks are. These markers can, in the future, be developed into
+new predictive tools that help doctors to choose the best treatment
+options for the individual patient.
+
+Research into the rare condition – Vasculitis (an acquired, immune
+mediated inflammatory disease involving blood vessels of many tissues
+and organs), needs sufficiently large quantities of data to enable
+well-informed conclusions about treatments and possible cures. It is
+thus essential to combine the databases of patient registries of several
+countries to build a dataset of sufficient size to enable meaningful
+research.
+
+## AIM
+
+To address the significant challenge of data siloing in RMD research, we
+will provide a reference FL registry environment with SPARQL backend in
+a reproducible containerised form. This will be open source and provided
+together with full supporting documentation to facilitate adoption and
+deployment by any consortia seeking to exploit these techniques,
+ensuring long-term and broad impact, not only on FAIRVASC. In parallel
+we will begin work on a standard SQL backend version, ensuring broad
+applicability for registries which may be based on more established
+technology. A proof-of-concept study utilising a sandbox semantic web
+environment and showcasing Simpson’s paradox for linear regression over
+distributed synthetic databases will be made available to demonstrate
+the environment.
+
+## Website Structure
+
+-   **Setup & Reproducibility** → Setup the environment step by step in
+    order to replicate our framework
+-   **Models** → detailed guide to build and use all the implemented
+    learning models available (Last Update Apr 30 2026)

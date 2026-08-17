@@ -1,0 +1,387 @@
+---
+title: "Poisson Regression"
+format: html
+editor: visual
+---
+
+# The Algorithm
+
+The algorithm implements a Federated Poisson Regression using the Iteratively Reweighted Least Squares (IRLS) optimization method. Poisson regression is standard for modeling count data and relies on a log-link function.
+
+The theoretical model assumes the expected value of the response variable $y_i$ given predictors $x_i$ is:
+
+$$\mu_i = E(y_i | x_i) = \exp(x_i^T \beta)$$
+
+To estimate the parameter vector $\beta$ iteratively in a federated architecture, the computation is split:
+
+-   **Local Computation (Slave Node)**: Given the current global parameter vector $\beta^{(t)}$, each slave $k$ calculates the linear predictor $\eta_i = x_i^T \beta^{(t)}$ and the expected rate $\mu_i = \exp(\eta_i)$. The iterative formulation requires a working weight $w_i = \mu_i$ and an adjusted dependent variable $z_i = \eta_i + \frac{y_i - \mu_i}{\mu_i}$. The slave then computes its local components for the normal equations: the weighted cross-product matrix $X_k^T W_k X_k$ and the weighted vector product $X_k^T W_k z_k$.
+
+-   **Global Aggregation & Update (Master Node)**: The master aggregates the local components to reconstruct the global matrices: $$X^T W X = \sum_k X_k^T W_k X_k, \quad X^T W z = \sum_k X_k^T W_k z_k$$ To prevent singular Hessian matrices, a ridge penalty ($\lambda = 10^{-6}$) is added to the diagonal of $X^T W X$. The master calculates the raw parameter update $\beta_{new} = (X^T W X)^{-1} (X^T W z)$. To ensure stability across iterations, a damping factor/learning rate ($\alpha = 0.3$) is applied to smooth the update: $\beta^{(t+1)} = \alpha \beta_{new} + (1 - \alpha) \beta^{(t)}$.
+
+# Code Implementaation
+
+The core mathematical logic is implemented in pure ES5 JavaScript to guarantee cross-environment compatibility across different database platforms.
+
+## Common Code
+
+### Master
+
+``` js
+// =============================================================
+// naive_Poisson_master.js
+// Shared math for the MASTER NODE (SPARQL & SQL)
+// =============================================================
+
+function zeros(n, m) {
+    var arr = [];
+    for (var i = 0; i < n; i++) {
+        var row = [];
+        for (var j = 0; j < m; j++) row.push(0.0);
+        arr.push(row);
+    }
+    return arr;
+}
+
+function fillVector(n, val) {
+    var vec = [];
+    for (var i = 0; i < n; i++) vec.push(val);
+    return vec;
+}
+
+function matVec(A, x) {
+    var r = [];
+    for (var i = 0; i < A.length; i++) r.push(0.0);
+    for (var i = 0; i < A.length; i++)
+        for (var j = 0; j < x.length; j++)
+            r[i] += A[i][j] * x[j];
+    return r;
+}
+
+function matInv(A) {
+    var n = A.length;
+    var M = [];
+    var I = zeros(n, n);
+
+    for (var i = 0; i < n; i++) {
+        M.push(A[i].slice());
+        I[i][i] = 1.0;
+    }
+
+    for (var i = 0; i < n; i++) {
+        var f = M[i][i];
+        if (Math.abs(f) < 1e-12) throw new Error("Singular Hesseian");
+
+        for (var j = 0; j < n; j++) {
+            M[i][j] /= f;
+            I[i][j] /= f;
+        }
+
+        for (var k = 0; k < n; k++) {
+            if (k === i) continue;
+            var g = M[k][i];
+            for (var j = 0; j < n; j++) {
+                M[k][j] -= g * M[i][j];
+                I[k][j] -= g * I[i][j];
+            }
+        }
+    }
+    return I;
+}
+
+function poisson_master_update(slave_results, beta_old, p, alpha, ridge) {
+    var XTWX = zeros(p, p);
+    var XTWZ = fillVector(p, 0.0);
+    var n_total = 0;
+
+    for (var k = 0; k < slave_results.length; k++) {
+        matAdd(XTWX, slave_results[k].xtwx);
+        vecAdd(XTWZ, slave_results[k].xtwz);
+        n_total += slave_results[k].n;
+    }
+
+    for (var i = 0; i < p; i++) {
+        XTWX[i][i] += ridge;
+    }
+
+    var inv = matInv(XTWX);
+    var beta_new = matVec(inv, XTWZ);
+
+    var beta_final = fillVector(p, 0.0);
+    for (var i = 0; i < p; i++) {
+        beta_final[i] = alpha * beta_new[i] + (1.0 - alpha) * beta_old[i];
+    }
+
+    return { 
+        beta: beta_final, 
+        cov: inv, 
+        n: n_total 
+    };
+}
+```
+
+The *poisson_master_update(slave_results, beta_old, p, alpha, ridge)* function performs global aggregation and parameter updates:  
+  - Sums `xtwx`, `xtwz`, and sample sizes n across all slave inputs.  
+  - Applies the **ridge** value to the diagonal elements of the aggregated $X^TWX$ matrix.  
+  - Computes the matrix inverse (*matInv*) and derives the raw update step using matrix-vector multiplication (*matVec*).
+  - Applies the exponential smoothing factor **alpha** to blend the old coefficients with the new ones.
+  - Returns the new coefficient vector `beta`, the covariance matrix (inverse Hessian) `cov`, and total `n`.
+
+### Slave
+
+``` js
+// =============================================================
+// naive_Poisson_slave.js
+// Shared math for the SLAVE NODE (SPARQL & SQL)
+// =============================================================
+
+function poisson_slave_stats(xMatrix, yVals, beta) {
+    var p = beta.length;
+    var XTWX = [];
+    for (var i = 0; i < p; i++) {
+        var r = [];
+        for (var j = 0; j < p; j++) r.push(0.0);
+        XTWX.push(r);
+    }
+    
+    var XTWZ = [];
+    for (var i = 0; i < p; i++) XTWZ.push(0.0);
+    var nobs = 0;
+
+    for (var n = 0; n < xMatrix.length; n++) {
+        var x = xMatrix[n];
+        var y = yVals[n];
+
+        if (isNaN(y)) continue;
+
+        var eta = 0.0;
+        for (var i = 0; i < p; i++) eta += beta[i] * x[i];
+
+        var mu = Math.exp(eta);
+
+        // Clamping per stabilità numerica
+        if (mu > 1e10 || mu < 1e-10) continue;
+
+        var w = mu;
+        var z = eta + (y - mu) / mu;
+
+        for (var i = 0; i < p; i++) {
+            XTWZ[i] += w * x[i] * z;
+            for (var j = 0; j < p; j++) {
+                XTWX[i][j] += w * x[i] * x[j];
+            }
+        }
+        nobs++;
+    }
+
+    return {
+        xtwx: XTWX,
+        xtwz: XTWZ,
+        n: nobs
+    };
+}
+```
+
+The *poisson_slave_stats(xMatrix, yVals, beta)* function handles the local IRLS calculations:
+
+-   Computes the linear predictor `eta` and applies the exponential link function to obtain `mu`.
+-   Clamps `mu` strictly between $10^{-10}$ and $10^{10}$ to prevent numerical overflow/underflow.
+-   Defines the observation weight `w = mu` and the adjusted target `z = eta + (y - mu) / mu`.
+-   Accumulates and returns the local partial matrices `xtwx` ($X^T W X$), `xtwz` ($X^T W z$), and the number of valid observations `n`.
+
+## Model specific implementation
+
+::::: panel-tabset
+## SQL
+
+::: panel-tabset
+### Master
+
+``` js
+// =============================================================
+// SQL_naive_Poisson_master.js
+// PL/v8 function body for the SQL MASTER 
+// =============================================================
+
+const p = x_cols.length + 1;
+let beta = Array(p).fill(0.0);
+
+const alpha = 0.3;
+const ridge = 1e-6;
+
+const terms = ["(Intercept)"].concat(x_cols);
+const cols_sql = x_cols.map(c => "'" + c + "'").join(",");
+
+for (let iter = 1; iter <= n_iter; iter++) {
+    const beta_sql = `ARRAY[${beta.join(",")}]::float8[]`;
+    let slave_results = [];
+
+    // Sequential/Parallel querying of workers via dblink
+    for (const s of slaves) {
+        const conninfo = "host=" + s + " dbname=postgres user=worker_user password=worker";
+
+        const sql = `
+            SELECT result_json
+            FROM dblink(
+                '${conninfo}',
+                $dblink$
+                    SELECT sql_poisson_slave(
+                        '${tbl_name}',
+                        '${y_col}',
+                        ARRAY[${cols_sql}]::text[],
+                        ${beta_sql}
+                    )
+                $dblink$
+            ) AS t(result_json text);
+        `;
+
+        const r = plv8.execute(sql)[0];
+        if (r && r.result_json) {
+            const stats = JSON.parse(r.result_json);
+            slave_results.push({
+                xtwx: stats.xtwx,
+                xtwz: stats.xtwz,
+                n: stats.n
+            });
+        }
+    }
+
+    const res = poisson_master_update(slave_results, beta, p, alpha, ridge);
+    beta = res.beta;
+
+    if (iter === n_iter) {
+        for (let i = 0; i < p; i++) {
+            const se = Math.sqrt(res.cov[i][i]);
+            const z = beta[i] / se;
+
+            plv8.return_next({
+                iteration: iter,
+                term: terms[i],
+                estimate: beta[i],
+                std_error: se,
+                z_value: z
+            });
+        }
+    }
+}
+return;
+```
+
+The SQL implementation handles the iteration logic through a predefined n_iter loop:  
+  - Sets the learning rate **alpha** = 0.3 and penalty **ridge** = 1e-6.  
+  - Iteratively calls the worker nodes via PostgreSQL `dblink`, passing the target table, target column, feature array, and the current **beta** array.  
+  - Parses the incoming JSON responses containing **xtwx** and **xtwz** and feeds them to the update function.  
+  - Upon reaching the final iteration, it computes the standard errors (se = sqrt(cov[i][i])) and z-statistics, yielding them row by row using plv8.return_next.
+
+:::
+
+## SPARQL
+
+::: panel-tabset
+### Master
+
+``` js
+// =============================================================
+// SPARQL_naive_Poisson_master.js
+// Communication interface for the MASTER node in SPARQL
+// =============================================================
+
+function sparql_poisson_master(slaveDataConcat, betaStr) {
+    var raw = slaveDataConcat.split("|||");
+    var parts = [];
+
+    for (var i = 0; i < raw.length; i++) {
+        var s = raw[i].trim();
+        if (s.length > 0) parts.push(JSON.parse(s));
+    }
+
+    if (parts.length === 0) throw new Error("Nessun dato ricevuto dagli slave.");
+
+    var bParts = betaStr.split(",");
+    var beta = [];
+    for (var i = 0; i < bParts.length; i++) beta.push(parseFloat(bParts[i]));
+    
+    var alpha = 0.3;
+    var ridge = 1e-6;
+
+    var res = poisson_master_update(parts, beta, beta.length, alpha, ridge);
+
+    return JSON.stringify({
+        beta: res.beta,
+        cov: res.cov,
+        n: res.n
+    });
+}
+```
+
+  - Splits the incoming concatenated string (slaveDataConcat) separated by ||| into individual JSON objects.  
+  - Parses the comma-separated betaStr back into an array.  
+  - Hardcodes alpha and ridge directly inside the ES5 context to bypass numerical binding bugs specific to Apache Jena.  
+  - Returns a stringified JSON containing the new **beta**, covariance matrix **cov**, and total **n**.
+
+### Slave
+
+``` js
+// =============================================================
+// SPARQL_naive_Poisson_slave.js
+// Communication interface for SLAVE nodes in SPARQL
+// =============================================================
+
+function sparql_poisson_slave(xConcat, yConcat, betaStr) {
+    if (!xConcat || xConcat.trim() === "") {
+        return JSON.stringify({ xtwx: [], xtwz: [], n: 0 });
+    }
+
+    var rawX = xConcat.split("|");
+    var rawY = yConcat.split("|");
+    var xMatrix = [];
+    var yVals = [];
+
+    for (var i = 0; i < rawX.length; i++) {
+        var r = rawX[i].trim();
+        if (r.length > 0) {
+            var parts = r.split(" ");
+            var xRow = [1.0]; 
+            for (var k = 0; k < parts.length; k++) {
+                xRow.push(parseFloat(parts[k]));
+            }
+            xMatrix.push(xRow);
+            yVals.push(parseFloat(rawY[i].trim()));
+        }
+    }
+
+    var p = xMatrix.length > 0 ? xMatrix[0].length : 1;
+    var beta = [];
+    if (betaStr && betaStr.trim() !== "") {
+        var bParts = betaStr.split(",");
+        for (var i = 0; i < p; i++) beta.push(parseFloat(bParts[i]));
+    } else {
+        for (var i = 0; i < p; i++) beta.push(0.0);
+    }
+
+    var result = poisson_slave_stats(xMatrix, yVals, beta);
+    return JSON.stringify(result);
+}
+```
+
+  - Reconstructs the data matrices by splitting strings along the | character.  
+  - Modifies the predictor matrix on-the-fly by prepending 1.0 as a fixed intercept term.  
+  - Constructs the beta vector (defaulting to zero if empty) and calls the core math engine.  
+
+:::
+:::::
+
+# Shared Data
+
+## Master to Slave
+
+The Master sends this to the Slave:
+
+**Database metadata**: Table name and column names (tbl_name, y_col, x_cols); **beta**: the current model state;
+
+## Slave to Master
+
+**xtwx**: The local weighted cross-product matrix.
+
+**xtwz**: The local weighted vector product of the predictors and the adjusted response.
+
+**n**: Total local row count of valid observation.
