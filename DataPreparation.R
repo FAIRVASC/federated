@@ -1,0 +1,97 @@
+# =============================================================
+# DATA PREPARATION - Prediction model
+# =============================================================
+setwd("~/Desktop/Federated_Learning/")
+winequality <- read.csv("http://archive.ics.uci.edu/ml/machine-learning-databases/wine-quality/winequality-white.csv", sep = ";")
+winequality$binary_quality <- ifelse(winequality$quality >= 6, 1, 0)
+colnames(winequality) <- gsub("\\.", "_", colnames(winequality))
+colnames(winequality)<- tolower(colnames(winequality))
+
+set.seed(123)
+slave1_data <- winequality[sample.int(nrow(winequality), 123), ]
+set.seed(321)
+slave2_data <- winequality[sample.int(nrow(winequality), 321), ]
+all_data <- rbind(slave1_data, slave2_data)
+
+# convert into .ttl
+library(readr)
+csv_to_turtle <- function(table, output_path, slave_id) {
+  df <- table
+  feature_cols <- names(df)[1:11]
+  y_col        <- "quality"
+  
+  
+  lines <- c('@prefix fv: <http://example.org/fairvasc#> .\n')
+  
+  for (i in seq_len(nrow(df))) {
+    
+    uri      <- sprintf("<http://example.org/patient/%s/%04d>", slave_id, i)
+    features <- paste(as.numeric(df[i, feature_cols]), collapse = " ")
+    y_val    <- as.numeric(df[i, y_col])
+    
+    lines <- c(lines,
+               sprintf('%s fv:features "%s" ;', uri, features),
+               sprintf('   fv:y        "%g"  .\n', y_val)
+    )
+  }
+  writeLines(lines, output_path)
+  cat(sprintf("Written: %s  (%d rows)\n", output_path, nrow(df)))
+}
+
+csv_to_turtle(slave1_data, 'slave1.ttl', 'slave1')
+csv_to_turtle(slave2_data, 'slave2.ttl', 'slave2')
+
+# =============================================================
+# DATA PREPARATION - Risk model
+# =============================================================
+library(survival)
+
+bladder <- survival::bladder
+bladder$treatment <- bladder$rx - 1
+cox_slave1_data <- bladder[1:200, c("treatment","number","size","stop","event")]
+cox_slave2_data <- bladder[201:340, c("treatment","number","size","stop","event")]
+cox_all_data <- bladder
+
+cox_to_turtle <- function(df, output_path) {
+  lines <- c('@prefix : <http://example.org/> .',
+             '@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .')
+  
+  for (i in seq_len(nrow(df))) {
+    lines <- c(lines,
+               sprintf(':p%d :treatment %d ; :number %d ; :size %d ; :stop %d ; :event %d .',
+                       i, df$treatment[i], df$number[i], df$size[i], df$stop[i], df$event[i]))
+  }
+  writeLines(lines, output_path)
+  cat(sprintf("Written: %s  (%d rows)\n", output_path, nrow(df)))
+}
+
+cox_to_turtle(cox_slave1_data, 'cox_slave1.ttl')
+cox_to_turtle(cox_slave2_data, 'cox_slave2.ttl')
+
+# =============================================================
+# DATA LOADING - Push dataset on SQL slave nodes
+# =============================================================
+library(RPostgres)
+
+SQL_TABLE_NAME     <- "federated_data"
+COX_SQL_TABLE_NAME <- "cox_data"   
+
+con_slave1 <- dbConnect(RPostgres::Postgres(), host = '127.0.0.1', port = 5433, user = 'postgres', password = 'slv1')
+con_slave2 <- dbConnect(RPostgres::Postgres(), host = '127.0.0.1', port = 5434, user = 'postgres', password = 'slv2')
+
+# --- Dataset "Prediction model" (wine quality) ---
+cat("▸ Caricamento wine-quality su slave1...\n")
+dbWriteTable(con_slave1, SQL_TABLE_NAME, slave1_data, overwrite = TRUE, row.names = FALSE)
+cat("▸ Caricamento wine-quality su slave2...\n")
+dbWriteTable(con_slave2, SQL_TABLE_NAME, slave2_data, overwrite = TRUE, row.names = FALSE)
+
+# --- Dataset "Risk model" (bladder / Cox) ---
+cat("▸ Caricamento dati Cox su slave1...\n")
+dbWriteTable(con_slave1, COX_SQL_TABLE_NAME, cox_slave1_data, overwrite = TRUE, row.names = FALSE)
+cat("▸ Caricamento dati Cox su slave2...\n")
+dbWriteTable(con_slave2, COX_SQL_TABLE_NAME, cox_slave2_data, overwrite = TRUE, row.names = FALSE)
+
+dbDisconnect(con_slave1)
+dbDisconnect(con_slave2)
+
+cat("SQL uplad completed.\n")
